@@ -39,7 +39,40 @@ process idr_call {
   """
 }
 
-process pseudo_idr_from_bam {
+process make_pseudo_reps {
+  tag "${rep_name}"
+  stageInMode 'symlink'
+  stageOutMode 'move'
+
+  publishDir "${params.project_folder}/${idr_output}/pseudo_bams", mode: 'copy'
+
+  input:
+    tuple val(rep_name), path(bam)
+
+  output:
+    tuple val(rep_name), path("${rep_name}.pseudo1.bam"), path("${rep_name}.pseudo2.bam")
+
+  script:
+  """
+  set -eux
+
+  samtools view ${bam} | awk '{print \$1}' | sort -u | shuf > ${rep_name}.all_readnames.txt
+
+  total=\$(wc -l < ${rep_name}.all_readnames.txt)
+  half=\$(( (total + 1) / 2 ))
+
+  head -n \$half ${rep_name}.all_readnames.txt > ${rep_name}.names1.txt
+  tail -n \$((half + 1)) ${rep_name}.all_readnames.txt > ${rep_name}.names2.txt
+
+  samtools view -b -N ${rep_name}.names1.txt ${bam} -o ${rep_name}.pseudo1.bam
+  samtools view -b -N ${rep_name}.names2.txt ${bam} -o ${rep_name}.pseudo2.bam
+
+  samtools index ${rep_name}.pseudo1.bam
+  samtools index ${rep_name}.pseudo2.bam
+  """
+}
+
+process pseudo_idr {
   tag "${rep_name}"
   stageInMode 'symlink'
   stageOutMode 'move'
@@ -47,7 +80,7 @@ process pseudo_idr_from_bam {
   publishDir "${params.project_folder}/${idr_output}", mode: 'copy'
 
   input:
-    tuple val(rep_name), path(bam)
+    tuple val(rep_name), path(pseudo1_bam), path(pseudo2_bam)
 
   output:
     path("${rep_name}_pseudo_idr.narrowPeak")
@@ -59,16 +92,8 @@ process pseudo_idr_from_bam {
   """
   set -eux
 
-  mkdir -p ${params.project_folder}/${idr_output}
-
-  samtools view -b -s 0.5 ${bam} -o ${rep_name}.pseudo1.bam
-  samtools view -b -s 0.5 ${bam} -o ${rep_name}.pseudo2.bam
-
-  samtools index ${rep_name}.pseudo1.bam
-  samtools index ${rep_name}.pseudo2.bam
-
   macs2 callpeak \\
-    -t ${rep_name}.pseudo1.bam \\
+    -t ${pseudo1_bam} \\
     -n ${rep_name}_pseudo1 \\
     -f BAM \\
     -g ${params.macs3_genome} \\
@@ -77,7 +102,7 @@ process pseudo_idr_from_bam {
     -q 0.01
 
   macs2 callpeak \\
-    -t ${rep_name}.pseudo2.bam \\
+    -t ${pseudo2_bam} \\
     -n ${rep_name}_pseudo2 \\
     -f BAM \\
     -g ${params.macs3_genome} \\
@@ -85,7 +110,7 @@ process pseudo_idr_from_bam {
     --keep-dup all \\
     -q 0.01
 
- idr \\
+  idr \\
     --samples ${rep_name}_pseudo1_peaks.narrowPeak ${rep_name}_pseudo2_peaks.narrowPeak \\
     --input-file-type narrowPeak \\
     --rank signal.value \\
@@ -102,7 +127,7 @@ process pseudo_idr_from_bam {
 
 workflow {
 
-def idr_csv = params.idr_pairs_csv ?: "idr_pairs.csv"
+  def idr_csv = params.idr_pairs_csv ?: "idr_pairs.csv"
 
   rows = Channel
     .fromPath(idr_csv, checkIfExists: true)
@@ -118,7 +143,7 @@ def idr_csv = params.idr_pairs_csv ?: "idr_pairs.csv"
 
   idr_call(pairs_ch)
 
-if( params.do_pseudo_idr ) {
+  if( params.do_pseudo_idr ) {
 
     def pseudo_bam_csv = params.pseudo_idr_bam_csv ?: "pseudo_idr_bam.csv"
 
@@ -130,10 +155,10 @@ if( params.do_pseudo_idr ) {
       ! file("${params.project_folder}/${idr_output}/${row.rep_name}_pseudo_idr.narrowPeak").exists()
     }
 
-    pseudo_bam_ch = pseudo_rows.map { row ->
+    pseudo_input_ch = pseudo_rows.map { row ->
       tuple( row.rep_name, file(row.bam) )
     }
 
-    pseudo_idr_from_bam(pseudo_bam_ch)
+    pseudo_input_ch | make_pseudo_reps | pseudo_idr
   }
 }
