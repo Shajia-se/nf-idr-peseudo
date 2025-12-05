@@ -1,0 +1,148 @@
+#!/usr/bin/env nextflow
+nextflow.enable.dsl=2
+
+def idr_output = params.idr_output ?: "idr_output"
+
+process idr_call {
+  tag "${pair}"
+  stageInMode 'symlink'
+  stageOutMode 'move'
+
+  publishDir "${params.project_folder}/${idr_output}", mode: 'copy'
+
+  input:
+    tuple val(pair), path(peaks1), path(peaks2)
+  
+  output:
+    path("${pair}_idr.narrowPeak")
+    path("${pair}_idr.txt")
+    path("${pair}_idr.log")
+    path("${pair}_idr.txt.png")
+
+  script:
+  """
+  set -eux
+
+  mkdir -p ${params.project_folder}/${idr_output}
+
+  idr \\
+    --samples ${peaks1} ${peaks2} \\
+    --input-file-type narrowPeak \\
+    --rank signal.value \\
+    --output-file ${pair}_idr.txt \\
+    --log-output-file ${pair}_idr.log \\
+    --plot \\
+    --idr-threshold ${params.idr_threshold}
+
+  awk 'BEGIN{OFS="\\t"} !/^#/ {print \$1,\$2,\$3,"'${pair}'_IDR_peak_"NR,1000,".",\$7,\$8,\$9,\$10}' \\
+      ${pair}_idr.txt > ${pair}_idr.narrowPeak
+  """
+}
+
+//
+// 🔹 新增：一个「从 BAM 直接做到 pseudo-IDR」的一体化 process
+// 输入：rep_name（例如 sample1_rep1）、该 replicate 的 BAM
+// 步骤：
+//   1) samtools 随机抽样生成两个 pseudo BAM
+//   2) 对两个 pseudo BAM 各跑一次 MACS3
+//   3) 用这两个 pseudo peaks 做 IDR
+// 输出：<rep_name>_pseudo_idr.*
+//
+process pseudo_idr_from_bam {
+  tag "${rep_name}"
+  stageInMode 'symlink'
+  stageOutMode 'move'
+
+  publishDir "${params.project_folder}/${idr_output}", mode: 'copy'
+
+  input:
+    tuple val(rep_name), path(bam)
+
+  output:
+    path("${rep_name}_pseudo_idr.narrowPeak")
+    path("${rep_name}_pseudo_idr.txt")
+    path("${rep_name}_pseudo_idr.log")
+    path("${rep_name}_pseudo_idr.txt.png")
+
+  script:
+  """
+  set -eux
+
+  mkdir -p ${params.project_folder}/${idr_output}
+
+  samtools view -b -s 0.5 ${bam} -o ${rep_name}.pseudo1.bam
+  samtools view -b -s 0.5 ${bam} -o ${rep_name}.pseudo2.bam
+
+  samtools index ${rep_name}.pseudo1.bam
+  samtools index ${rep_name}.pseudo2.bam
+
+  macs3 callpeak \\
+    -t ${rep_name}.pseudo1.bam \\
+    -n ${rep_name}_pseudo1 \\
+    -f BAM \\
+    -g ${params.macs3_genome} \\
+    --outdir . \\
+    --keep-dup all \\
+    -q 0.01
+
+  macs3 callpeak \\
+    -t ${rep_name}.pseudo2.bam \\
+    -n ${rep_name}_pseudo2 \\
+    -f BAM \\
+    -g ${params.macs3_genome} \\
+    --outdir . \\
+    --keep-dup all \\
+    -q 0.01
+
+ idr \\
+    --samples ${rep_name}_pseudo1_peaks.narrowPeak ${rep_name}_pseudo2_peaks.narrowPeak \\
+    --input-file-type narrowPeak \\
+    --rank signal.value \\
+    --output-file ${rep_name}_pseudo_idr.txt \\
+    --log-output-file ${rep_name}_pseudo_idr.log \\
+    --plot \\
+    --idr-threshold ${params.idr_threshold}
+
+  awk 'BEGIN{OFS="\\t"} !/^#/ {print \$1,\$2,\$3,"'${rep_name}'_PSEUDO_IDR_peak_"NR,1000,".",\$7,\$8,\$9,\$10}' \\
+      ${rep_name}_pseudo_idr.txt > ${rep_name}_pseudo_idr.narrowPeak
+  """
+}
+
+
+workflow {
+
+def idr_csv = params.idr_pairs_csv ?: "idr_pairs.csv"
+
+  rows = Channel
+    .fromPath(idr_csv, checkIfExists: true)
+    .splitCsv(header: true)
+
+  rows = rows.filter { row ->
+    ! file("${params.project_folder}/${idr_output}/${row.pair_name}_idr.narrowPeak").exists()
+  }
+
+  pairs_ch = rows.map { row ->
+    tuple( row.pair_name, file(row.rep1_peaks), file(row.rep2_peaks) )
+  }
+
+  idr_call(pairs_ch)
+
+if( params.do_pseudo_idr ) {
+
+    def pseudo_bam_csv = params.pseudo_idr_bam_csv ?: "pseudo_idr_bam.csv"
+
+    pseudo_rows = Channel
+      .fromPath(pseudo_bam_csv, checkIfExists: true)
+      .splitCsv(header: true)
+
+    pseudo_rows = pseudo_rows.filter { row ->
+      ! file("${params.project_folder}/${idr_output}/${row.rep_name}_pseudo_idr.narrowPeak").exists()
+    }
+
+    pseudo_bam_ch = pseudo_rows.map { row ->
+      tuple( row.rep_name, file(row.bam) )
+    }
+
+    pseudo_idr_from_bam(pseudo_bam_ch)
+  }
+}
