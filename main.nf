@@ -138,7 +138,11 @@ workflow {
   }
 
   pairs_ch = rows.map { row ->
-    tuple( row.pair_name, file(row.rep1_peaks), file(row.rep2_peaks) )
+    def rep1 = file(row.rep1_peaks)
+    def rep2 = file(row.rep2_peaks)
+    assert rep1.exists() : "rep1_peaks not found for ${row.pair_name}: ${row.rep1_peaks}"
+    assert rep2.exists() : "rep2_peaks not found for ${row.pair_name}: ${row.rep2_peaks}"
+    tuple( row.pair_name, rep1, rep2 )
   }
 
   idr_call(pairs_ch)
@@ -156,7 +160,9 @@ workflow {
     }
 
     pseudo_input_ch = pseudo_rows.map { row ->
-      tuple( row.rep_name, file(row.bam) )
+      def bam = file(row.bam)
+      assert bam.exists() : "pseudo-IDR BAM not found for ${row.rep_name}: ${row.bam}"
+      tuple( row.rep_name, bam )
     }
 
     pseudo_input_ch | make_pseudo_reps | pseudo_idr
